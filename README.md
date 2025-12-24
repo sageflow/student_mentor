@@ -74,6 +74,7 @@ pip install -r requirements.txt
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `API_BASE_URL` | `http://localhost:8080` | Spring Boot backend URL |
+| `ADMIN_PASSWORD` | (empty) | **Required** - Password for admin login to get JWT token |
 | `DEEPSEEK_API_KEY` | (empty) | Deepseek API key for AI features |
 | `DEEPSEEK_API_URL` | `https://api.deepseek.com/v1/chat/completions` | Deepseek API endpoint |
 | `PORT` | `5000` | Flask server port |
@@ -82,12 +83,28 @@ pip install -r requirements.txt
 ```bash
 # Windows PowerShell
 $env:API_BASE_URL="http://localhost:8080"
-$env:DEEPSEEK_API_KEY="your-api-key"
+$env:ADMIN_PASSWORD="your-admin-password"
+$env:DEEPSEEK_API_KEY="your-api-key"  # Optional
 
 # Linux/Mac
 export API_BASE_URL=http://localhost:8080
-export DEEPSEEK_API_KEY=your-api-key
+export ADMIN_PASSWORD=your-admin-password
+export DEEPSEEK_API_KEY=your-api-key  # Optional
 ```
+
+### Authentication
+
+The service authenticates with the Spring Boot backend using JWT:
+
+1. On first API call, the service calls `POST /auth/login` with:
+   ```json
+   {
+     "username": "admin",
+     "password": "<ADMIN_PASSWORD>"
+   }
+   ```
+2. The JWT token is cached and reused for subsequent requests
+3. If a request returns 401/403, the token is refreshed automatically
 
 ## Running
 
@@ -420,6 +437,147 @@ The service works **fully without a Deepseek API key** for end-to-end testing:
 Flask==3.0.0
 flask-cors==4.0.0
 requests==2.31.0
+```
+
+---
+
+## Local Testing
+
+### Prerequisites
+
+1. Python 3.8+ installed
+2. Spring Boot backend running on `http://localhost:8080` (or configure `API_BASE_URL`)
+3. (Optional) Deepseek API key for AI features
+
+### Step 1: Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### Step 2: Start the Flask Service
+
+```bash
+# Without API key (uses fallback responses - perfect for testing)
+python app.py
+
+# Or with debug mode enabled
+$env:FLASK_DEBUG="True"  # Windows PowerShell
+python app.py
+```
+
+The service starts at `http://localhost:5000`
+
+### Step 3: Verify Health
+
+```bash
+curl http://localhost:5000/health
+```
+
+Expected response:
+```json
+{
+  "status": "healthy",
+  "api_base_url": "http://localhost:8080",
+  "auth_configured": true,
+  "deepseek_configured": false
+}
+```
+
+### Step 4: Trigger Processing
+
+```bash
+curl http://localhost:5000/student-mentor/123
+```
+
+Expected response: `202 Accepted` (empty body)
+
+### Step 5: Check Console Logs
+
+You should see async processing logs:
+
+```
+[Async] Starting wellbeing calculation for student 123
+[Async] Starting guidance generation for student 123
+[Async] Successfully saved wellbeing data for student 123
+[Async] Successfully saved guidances for student 123
+```
+
+### Step 6: Verify Data in Spring Boot
+
+Check that the data was persisted:
+
+```bash
+# Check wellbeing data
+curl http://localhost:8080/wellbeing/123
+
+# Check guidance data  
+curl http://localhost:8080/guidance/123
+```
+
+### Testing Without Spring Boot Backend
+
+If you don't have the Spring Boot backend running, you'll see error logs:
+
+```
+[Async] Error processing wellbeing for student 123: Connection error...
+```
+
+To test the Flask service in isolation, you can use a mock server or simply verify the health endpoint works.
+
+### Testing Different Scenarios
+
+| Test Case | How to Test |
+|-----------|-------------|
+| Valid student | `curl http://localhost:5000/student-mentor/123` |
+| Invalid student ID | `curl http://localhost:5000/student-mentor/abc` (returns 404) |
+| Health check | `curl http://localhost:5000/health` |
+| With debug logs | Set `FLASK_DEBUG=True` before running |
+
+### Sample Test Script (Windows PowerShell)
+
+```powershell
+# Set required environment variable
+$env:ADMIN_PASSWORD="your-admin-password"
+
+# Start the service (in a separate terminal)
+python app.py
+
+# Test health endpoint
+Invoke-RestMethod -Uri "http://localhost:5000/health" -Method Get
+
+# Trigger student processing
+Invoke-RestMethod -Uri "http://localhost:5000/student-mentor/123" -Method Get
+
+# Wait for async processing
+Start-Sleep -Seconds 3
+
+# Check Spring Boot for results (if running)
+Invoke-RestMethod -Uri "http://localhost:8080/wellbeing/123" -Method Get
+Invoke-RestMethod -Uri "http://localhost:8080/guidance/123" -Method Get
+```
+
+### Sample Test Script (Linux/Mac)
+
+```bash
+# Set required environment variable
+export ADMIN_PASSWORD=your-admin-password
+
+# Start the service (in a separate terminal)
+python app.py
+
+# Test health endpoint
+curl http://localhost:5000/health
+
+# Trigger student processing
+curl -i http://localhost:5000/student-mentor/123
+
+# Wait for async processing
+sleep 3
+
+# Check Spring Boot for results (if running)
+curl http://localhost:8080/wellbeing/123
+curl http://localhost:8080/guidance/123
 ```
 
 ---

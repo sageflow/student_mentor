@@ -16,9 +16,92 @@ CORS(app)  # Enable CORS for API access
 BASE_URL = os.getenv('API_BASE_URL', 'http://localhost:8080')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY', '')
 DEEPSEEK_API_URL = os.getenv('DEEPSEEK_API_URL', 'https://api.deepseek.com/v1/chat/completions')
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '')
 
 # Thread pool for async background tasks
 executor = ThreadPoolExecutor(max_workers=4)
+
+# JWT token cache
+_jwt_token = None
+_token_lock = threading.Lock()
+
+
+def get_jwt_token() -> Optional[str]:
+    """
+    Get JWT token by authenticating with the Spring Boot backend.
+    Caches the token for reuse.
+    
+    POST /auth/login
+    Body: { "username": "admin", "password": "<ADMIN_PASSWORD>" }
+    """
+    global _jwt_token
+    
+    # Return cached token if available
+    with _token_lock:
+        if _jwt_token:
+            return _jwt_token
+    
+    if not ADMIN_PASSWORD:
+        print("Warning: ADMIN_PASSWORD environment variable not set. Authentication will fail.")
+        return None
+    
+    try:
+        url = f"{BASE_URL}/auth/login"
+        payload = {
+            "username": "admin",
+            "password": ADMIN_PASSWORD
+        }
+        
+        response = requests.post(
+            url,
+            json=payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            # Token might be in 'token', 'accessToken', 'jwt', or directly in response
+            token = data.get('token') or data.get('accessToken') or data.get('jwt') or data.get('access_token')
+            
+            if token:
+                with _token_lock:
+                    _jwt_token = token
+                print("[Auth] Successfully obtained JWT token")
+                return token
+            else:
+                print(f"Warning: Login successful but no token found in response: {data}")
+                return None
+        else:
+            print(f"Warning: Login failed. Status: {response.status_code}, Response: {response.text}")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        print(f"Warning: Error during login: {str(e)}")
+        return None
+
+
+def get_auth_headers() -> Dict[str, str]:
+    """
+    Get headers with JWT Bearer token for authenticated requests.
+    """
+    headers = {'Content-Type': 'application/json'}
+    
+    token = get_jwt_token()
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    
+    return headers
+
+
+def clear_jwt_token():
+    """
+    Clear cached JWT token (call this if token expires).
+    """
+    global _jwt_token
+    with _token_lock:
+        _jwt_token = None
+    print("[Auth] JWT token cleared")
 
 
 def get_student_info(student_id):
@@ -38,7 +121,14 @@ def get_student_info(student_id):
     """
     try:
         url = f"{BASE_URL}/student/info/{student_id}"
-        response = requests.get(url, timeout=10)
+        headers = get_auth_headers()
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        # If unauthorized, clear token and retry once
+        if response.status_code == 401 or response.status_code == 403:
+            clear_jwt_token()
+            headers = get_auth_headers()
+            response = requests.get(url, headers=headers, timeout=10)
         
         if response.status_code == 200:
             return response.json(), None, 200
@@ -46,6 +136,8 @@ def get_student_info(student_id):
             return None, "Invalid student ID", 400
         elif response.status_code == 404:
             return None, "Student not found", 404
+        elif response.status_code == 401 or response.status_code == 403:
+            return None, "Authentication failed. Check ADMIN_PASSWORD environment variable.", response.status_code
         else:
             return None, f"Error: {response.status_code} - {response.text}", response.status_code
     except requests.exceptions.RequestException as e:
@@ -439,7 +531,7 @@ def calculate_stress_score(student_info: Dict[str, Any]) -> float:
     Total: 0-90
     """
     habits_score = calculate_habits_stress_score(student_info.get('habitsSummary'))
-    complaints_score = analyze_complaints_with_deepseek(student_info.get('unresolvedComplaints', []))
+    complaints_score = analyze_complaints_with_deepseek(student_info.get('unresolvedComplaints') or [])
     pulse_score = calculate_pulse_stress_score(student_info.get('currentWeekPulse'))
     
     total_score = habits_score + complaints_score + pulse_score
@@ -492,43 +584,41 @@ def generate_personalized_habits(student_info: Dict[str, Any]) -> List[str]:
         # Fallback: return semi-personalized habits based on available data (for testing without API key)
         habits = []
         
-        interests = student_info.get('interests', {})
-        hobbies = interests.get('hobbies', [])
+        # Handle None values safely using 'or {}'
+        interests = student_info.get('interests') or {}
+        hobbies = interests.get('hobbies') or []
         
         # Add hobby-based habit if available
-        if hobbies:
+        if hobbies and len(hobbies) > 0:
             hobby = hobbies[0] if isinstance(hobbies[0], str) else str(hobbies[0])
             habits.append(f"Dedicate 30 minutes daily to practice {hobby.lower().replace('_', ' ')} to develop your skills and passion")
         else:
             habits.append("Engage in at least 30 minutes of physical activity daily to boost energy and mood")
         
-        # Add habit based on habits summary
-        habits_summary = student_info.get('habitsSummary', {})
-        if habits_summary:
-            screen_time = habits_summary.get('averageScreenTimeHours', 0)
-            if screen_time and screen_time > 4:
-                habits.append("Take a 10-minute break every hour from screens to rest your eyes and stretch")
-            else:
-                habits.append("Practice 10 minutes of mindfulness meditation before starting your day")
-            
-            water_intake = habits_summary.get('averageWaterIntake', 0)
-            if water_intake and water_intake < 2:
-                habits.append("Drink at least 8 glasses of water throughout the day, keeping a water bottle nearby")
-            else:
-                habits.append("Read for 20 minutes before bed instead of using electronic devices")
+        # Add habit based on habits summary (handle None safely)
+        habits_summary = student_info.get('habitsSummary') or {}
+        screen_time = habits_summary.get('averageScreenTimeHours')
+        water_intake = habits_summary.get('averageWaterIntake')
+        
+        if screen_time is not None and screen_time > 4:
+            habits.append("Take a 10-minute break every hour from screens to rest your eyes and stretch")
         else:
-            habits.append("Practice 5 minutes of deep breathing exercises each morning to start your day calmly")
-            habits.append("Write down 3 things you're grateful for before going to sleep")
+            habits.append("Practice 10 minutes of mindfulness meditation before starting your day")
+        
+        if water_intake is not None and water_intake < 2:
+            habits.append("Drink at least 8 glasses of water throughout the day, keeping a water bottle nearby")
+        else:
+            habits.append("Read for 20 minutes before bed instead of using electronic devices")
         
         return habits[:3]  # Return max 3 habits
     
     try:
-        # Extract relevant data
-        physical_profile = student_info.get('physicalProfile', {})
-        interests = student_info.get('interests', {})
+        # Extract relevant data (handle None values safely)
+        physical_profile = student_info.get('physicalProfile') or {}
+        interests = student_info.get('interests') or {}
         iq_score = student_info.get('iqScore')
         eq_score = student_info.get('eqScore')
-        ocean_score = student_info.get('oceanScore', {})
+        ocean_score = student_info.get('oceanScore') or {}
         
         # Build comprehensive prompt
         prompt_parts = []
@@ -741,10 +831,11 @@ def save_guidances(student_id: int, guidances: List[str], guidance_date: Optiona
             "date": guidance_date
         }
         
+        headers = get_auth_headers()
         response = requests.post(
             url,
             json=payload,
-            headers={'Content-Type': 'application/json'},
+            headers=headers,
             timeout=10
         )
         
@@ -770,9 +861,10 @@ def generate_wellbeing_gist(student_info: Dict[str, Any]) -> str:
     
     Returns a paragraph describing how the student is doing.
     """
-    habits_summary = student_info.get('habitsSummary', {})
-    unresolved_complaints = student_info.get('unresolvedComplaints', [])
-    current_week_pulse = student_info.get('currentWeekPulse', {})
+    # Handle None values safely
+    habits_summary = student_info.get('habitsSummary') or {}
+    unresolved_complaints = student_info.get('unresolvedComplaints') or []
+    current_week_pulse = student_info.get('currentWeekPulse') or {}
     
     if not DEEPSEEK_API_KEY:
         # Fallback: generate a basic wellbeing gist based on available data (for testing without API key)
@@ -949,10 +1041,11 @@ def save_wellbeing_data(student_id: int, stress_score: float, wellbeing_gist: st
             "wellbeingGist": wellbeing_gist
         }
         
+        headers = get_auth_headers()
         response = requests.post(
             url,
             json=payload,
-            headers={'Content-Type': 'application/json'},
+            headers=headers,
             timeout=10
         )
         
@@ -973,6 +1066,7 @@ def health():
     return jsonify({
         'status': 'healthy',
         'api_base_url': BASE_URL,
+        'auth_configured': bool(ADMIN_PASSWORD),
         'deepseek_configured': bool(DEEPSEEK_API_KEY)
     }), 200
 
